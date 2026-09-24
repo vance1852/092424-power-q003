@@ -94,7 +94,7 @@ class SupplyServiceTests(unittest.TestCase):
             self.service.submit_nomination("dispatch", changed)
 
     def test_outage_reduces_allocation_and_transfer_consumes_inventory(self) -> None:
-        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-25T23:59:59Z", "50", "检修")
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "50", "检修")
         for number, requested, priority in ((1, "40000", 10), (2, "30000", 20)):
             self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "pipe-a-b", "shipper_id": f"shipper-{number}", "service_date": "2026-09-25", "requested_mwh": requested, "priority": priority, "idempotency_key": f"key-{number}"})
         allocation = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")

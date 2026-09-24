@@ -66,7 +66,7 @@ class JsonApplication:
             if method == "POST" and path == "/routes":
                 return Response(201, self.service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
-                return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
+                return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"], payload.get("idempotency_key")))
             if method == "POST" and path == "/inventory/lots":
                 return Response(201, self.service.add_inventory_lot(actor, payload))
             if method == "GET" and path == "/inventory/summary":

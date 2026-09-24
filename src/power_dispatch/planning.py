@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Mapping, Sequence
 
@@ -102,15 +103,101 @@ def moving_average(points: Sequence[PricePoint], sessions: int) -> Decimal | Non
     return quantize_money(sum(values, ZERO) / Decimal(len(values)))
 
 
+@dataclass(frozen=True, slots=True)
+class CapacityConstraint:
+    """一条作用于 UTC 半开区间 [starts_at, ends_at) 的能力限制。"""
+
+    source: str
+    starts_at: datetime | None
+    ends_at: datetime | None
+    capacity_percent: Decimal
+    reason: str
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "source": self.source,
+            "starts_at": None if self.starts_at is None else _utc_iso(self.starts_at),
+            "ends_at": None if self.ends_at is None else _utc_iso(self.ends_at),
+            "capacity_percent": decimal_text(self.capacity_percent),
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityReport:
+    """服务窗口内的有效上限及参与计算的约束来源。"""
+
+    available: Decimal
+    constraints: tuple[CapacityConstraint, ...]
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _checked_percent(value: Decimal) -> Decimal:
+    if not value.is_finite() or value < ZERO or value > HUNDRED:
+        raise ValueError("capacity_percent 必须是 0 到 100 的有限数值")
+    return value
+
+
+def _microseconds(delta: timedelta) -> Decimal:
+    return Decimal(delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds)
+
+
 def effective_capacity(
     nominal: Decimal,
-    capacity_percentages: Iterable[Decimal],
-) -> Decimal:
-    result = nominal
-    for percentage in capacity_percentages:
-        bounded = max(ZERO, min(HUNDRED, percentage))
-        result *= bounded / HUNDRED
-    return quantize_volume(result)
+    window_start: datetime,
+    window_end: datetime,
+    constraints: Iterable[CapacityConstraint],
+) -> CapacityReport:
+    """按业务规则计算窗口有效上限。
+
+    任一时刻生效的上限取该时刻所有重叠约束中的最严格值（最小百分比），
+    不做连乘；窗口结果按各时段时长加权。约束区间为半开区间，
+    边界相接的约束互不重叠；超界百分比直接拒绝而不是静默钳制。
+    """
+    if nominal < ZERO:
+        raise ValueError("名义能力不能为负数")
+    if window_start.tzinfo is None or window_end.tzinfo is None:
+        raise ValueError("能力窗口必须带时区")
+    if window_end <= window_start:
+        raise ValueError("能力窗口结束必须晚于开始")
+    relevant: list[CapacityConstraint] = []
+    points: set[datetime] = {window_start, window_end}
+    for constraint in constraints:
+        _checked_percent(constraint.capacity_percent)
+        for boundary in (constraint.starts_at, constraint.ends_at):
+            if boundary is not None and boundary.tzinfo is None:
+                raise ValueError("约束时间必须带时区")
+        if constraint.starts_at is not None and constraint.ends_at is not None:
+            if constraint.ends_at <= constraint.starts_at:
+                raise ValueError("约束结束必须晚于开始")
+        starts = window_start if constraint.starts_at is None else max(constraint.starts_at, window_start)
+        ends = window_end if constraint.ends_at is None else min(constraint.ends_at, window_end)
+        if ends <= starts:
+            continue
+        relevant.append(constraint)
+        points.add(starts)
+        points.add(ends)
+    ordered = sorted(points)
+    span = _microseconds(window_end - window_start)
+    total = ZERO
+    for left, right in zip(ordered, ordered[1:]):
+        if right <= left:
+            continue
+        midpoint = left + (right - left) / 2
+        active = [
+            item
+            for item in relevant
+            if (item.starts_at is None or item.starts_at <= midpoint)
+            and (item.ends_at is None or midpoint < item.ends_at)
+        ]
+        percent = min((item.capacity_percent for item in active), default=HUNDRED)
+        share = _microseconds(right - left) / span
+        total += nominal * percent / HUNDRED * share
+    ordered_constraints = tuple(sorted(relevant, key=lambda item: item.source))
+    return CapacityReport(quantize_volume(total), ordered_constraints)
 
 
 @dataclass(frozen=True, slots=True)

@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS route_outages (
     ends_at TEXT,
     capacity_percent TEXT NOT NULL,
     reason TEXT NOT NULL,
+    idempotency_key TEXT,
     state TEXT NOT NULL DEFAULT 'announced' CHECK(state IN ('announced','active','closed','cancelled')),
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
@@ -209,6 +210,15 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(route_outages)").fetchall()
+    }
+    if "idempotency_key" not in columns:
+        connection.execute("ALTER TABLE route_outages ADD COLUMN idempotency_key TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_outages_idempotency "
+        "ON route_outages(idempotency_key)"
+    )
 
 
 @contextmanager
