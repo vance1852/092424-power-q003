@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
-    UNIQUE(route_id, service_date, input_sha256)
+    UNIQUE(route_id, service_date)
 );
 
 CREATE TABLE IF NOT EXISTS transfers (

@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
-from decimal import Decimal
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
@@ -14,17 +14,20 @@ from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFaile
 from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
 from .planning import (
     AllocationRequest,
+    CapacityLimit,
+    DailyCapacity,
     PricePoint,
     allocate_capacity,
     canonical_json,
+    daily_effective_capacity,
     decimal_text,
     delivered_after_loss,
     digest,
-    effective_capacity,
     latest_streak,
     moving_average,
     quantize_volume,
     scenario_projection,
+    service_day_bounds,
     weighted_inventory_cost,
 )
 from .storage import initialize, transaction
@@ -245,14 +248,29 @@ class SupplyService:
             raise ValidationFailed(str(exc)) from exc
         if end is not None and end <= start:
             raise ValidationFailed("ends_at 必须晚于 starts_at")
-        percentage = Decimal(str(capacity_percent))
-        if percentage < 0 or percentage > 100:
+        try:
+            percentage = Decimal(str(capacity_percent))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValidationFailed("capacity_percent 必须是十进制数值") from exc
+        if not percentage.is_finite() or percentage < 0 or percentage > 100:
             raise ValidationFailed("capacity_percent 必须在 0 到 100 之间")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationFailed("reason 不能为空")
+        end_text = None if end is None else utc_text(end)
+        percentage_text = decimal_text(quantize_volume(percentage))
+        duplicate = self.connection.execute(
+            "SELECT outage_id FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
+            "AND starts_at=? AND COALESCE(ends_at,'')=COALESCE(?, '') "
+            "AND capacity_percent=? AND reason=?",
+            (route_id, utc_text(start), end_text, percentage_text, reason.strip()),
+        ).fetchone()
+        if duplicate is not None:
+            raise Conflict("同一限制事件已登记，重复登记不会再次扣减能力")
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
                 "INSERT INTO route_outages(route_id,starts_at,ends_at,capacity_percent,reason,created_by,created_at) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (route_id, utc_text(start), None if end is None else utc_text(end), decimal_text(percentage), reason, actor_id, self._now()),
+                (route_id, utc_text(start), end_text, percentage_text, reason.strip(), actor_id, self._now()),
             )
             outage_id = int(cursor.lastrowid)
             self._audit("route", route_id, "outage.announced", actor_id, {"outage_id": outage_id})
@@ -345,28 +363,101 @@ class SupplyService:
             raise Conflict("提名编号或幂等键冲突") from exc
         return response
 
-    def _capacity_for_date(self, route: sqlite3.Row, service_date: str) -> Decimal:
-        start = service_date + "T00:00:00Z"
-        end = service_date + "T23:59:59Z"
+    def _capacity_for_date(
+        self, route: sqlite3.Row, service_date: str
+    ) -> tuple[DailyCapacity, list[sqlite3.Row]]:
+        window_start, window_end = service_day_bounds(service_date)
         rows = self.connection.execute(
-            "SELECT capacity_percent FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
-            "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
-            (route["route_id"], end, start),
+            "SELECT outage_id,starts_at,ends_at,capacity_percent,reason FROM route_outages "
+            "WHERE route_id=? AND state IN ('announced','active') "
+            "AND starts_at<? AND (ends_at IS NULL OR ends_at>?) ORDER BY outage_id",
+            (route["route_id"], utc_text(window_end), utc_text(window_start)),
         ).fetchall()
-        percentages = [Decimal(row["capacity_percent"]) for row in rows]
-        return effective_capacity(Decimal(route["daily_capacity"]), percentages)
+        limits = [
+            CapacityLimit(
+                source_id=f"outage-{row['outage_id']}",
+                starts_at=parse_utc(row["starts_at"], "starts_at"),
+                ends_at=None if row["ends_at"] is None else parse_utc(row["ends_at"], "ends_at"),
+                capacity_percent=Decimal(row["capacity_percent"]),
+                source_type="outage",
+                label=row["reason"],
+            )
+            for row in rows
+        ]
+        plan = daily_effective_capacity(
+            Decimal(route["daily_capacity"]), limits, service_date
+        )
+        return plan, rows
+
+    @staticmethod
+    def _limit_summaries(outage_rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+        return [
+            {
+                "source_id": f"outage-{row['outage_id']}",
+                "type": "outage",
+                "starts_at": row["starts_at"],
+                "ends_at": row["ends_at"],
+                "capacity_percent": row["capacity_percent"],
+                "reason": row["reason"],
+            }
+            for row in outage_rows
+        ]
+
+    @staticmethod
+    def _nomination_summaries(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+        return [
+            {
+                "nomination_id": row["nomination_id"],
+                "shipper_id": row["shipper_id"],
+                "requested_mwh": row["requested_mwh"],
+                "priority": row["priority"],
+                "submitted_at": row["submitted_at"],
+            }
+            for row in rows
+        ]
 
     def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
         self._require(actor_id, "allocation.run")
         route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
         if route is None:
             raise NotFound("送出线路不存在")
-        nominations = self.connection.execute(
-            "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
-            "ORDER BY priority,submitted_at,nomination_id",
+        try:
+            date.fromisoformat(service_date)
+        except (ValueError, TypeError) as exc:
+            raise ValidationFailed("service_date 必须是 YYYY-MM-DD 日期") from exc
+        capacity_plan, outage_rows = self._capacity_for_date(route, service_date)
+        limit_summaries = self._limit_summaries(outage_rows)
+        # 摘要覆盖该服务日的全部提名（不含会流转的状态字段），这样计划确认后
+        # 提名状态从 submitted 变为 allocated 也能复算出同一份输入摘要。
+        all_nominations = self.connection.execute(
+            "SELECT * FROM nominations WHERE route_id=? AND service_date=? ORDER BY nomination_id",
             (route_id, service_date),
         ).fetchall()
-        if not nominations:
+        input_value = {
+            "route": dict(route),
+            "service_date": service_date,
+            "nominations": self._nomination_summaries(all_nominations),
+            "limits": limit_summaries,
+            "available_capacity": decimal_text(capacity_plan.effective),
+        }
+        input_sha256 = digest(input_value)
+        existing = self.connection.execute(
+            "SELECT allocation_id,input_sha256,result_json FROM allocation_runs "
+            "WHERE route_id=? AND service_date=? ORDER BY allocation_id DESC LIMIT 1",
+            (route_id, service_date),
+        ).fetchone()
+        if existing is not None:
+            # 同一服务日再次计算：输入摘要一致时复用原结果；限制事件或提名被
+            # 修订导致摘要变化时拒绝，绝不静默改写已经确认的发电计划。
+            if existing["input_sha256"] != input_sha256:
+                raise Conflict("该服务日发电计划已经确认，限制事件修订不得静默改写既有计划")
+            return {
+                "allocation_id": existing["allocation_id"],
+                **json.loads(existing["result_json"]),
+                "replayed": True,
+            }
+        pending = [row for row in all_nominations if row["state"] == "submitted"]
+        if not pending:
             raise InvalidState("没有待分配提名")
         requests = [
             AllocationRequest(
@@ -375,16 +466,17 @@ class SupplyService:
                 int(row["priority"]),
                 row["submitted_at"],
             )
-            for row in nominations
+            for row in pending
         ]
-        available = self._capacity_for_date(route, service_date)
-        input_value = [dict(row) for row in nominations]
-        input_sha256 = digest({"route": dict(route), "nominations": input_value, "capacity": str(available)})
+        available = capacity_plan.effective
         result_rows = allocate_capacity(available, requests)
         result = {
             "route_id": route_id,
             "service_date": service_date,
+            "nominal_capacity": decimal_text(capacity_plan.nominal),
             "available_capacity": decimal_text(available),
+            "capacity_segments": capacity_plan.source_segments(),
+            "capacity_limits": limit_summaries,
             "allocations": result_rows,
         }
         with transaction(self.connection, immediate=True):
@@ -402,7 +494,7 @@ class SupplyService:
                 )
             allocation_id = int(cursor.lastrowid)
             self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
-        return {"allocation_id": allocation_id, **result}
+        return {"allocation_id": allocation_id, **result, "replayed": False}
 
     def dispatch_transfer(
         self,

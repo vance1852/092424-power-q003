@@ -5,13 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Mapping, Sequence
 
 
 ZERO = Decimal("0")
+ONE = Decimal("1")
 HUNDRED = Decimal("100")
 BASIS_POINTS = Decimal("10000")
+DAY_SECONDS = Decimal(86400)
+UTC = timezone.utc
 
 
 def quantize_volume(value: Decimal) -> Decimal:
@@ -102,15 +106,175 @@ def moving_average(points: Sequence[PricePoint], sessions: int) -> Decimal | Non
     return quantize_money(sum(values, ZERO) / Decimal(len(values)))
 
 
+def clamp_percentage(percentage: Decimal) -> Decimal:
+    """将能力百分比收敛到 [0,100]，超界值按最近边界处理而非反转扣减。"""
+    return max(ZERO, min(HUNDRED, percentage))
+
+
 def effective_capacity(
     nominal: Decimal,
     capacity_percentages: Iterable[Decimal],
 ) -> Decimal:
-    result = nominal
+    """同一时刻并存的多条限制取最严格值（最小值），绝不连乘重复扣减。"""
+    factor = ONE
     for percentage in capacity_percentages:
-        bounded = max(ZERO, min(HUNDRED, percentage))
-        result *= bounded / HUNDRED
-    return quantize_volume(result)
+        factor = min(factor, clamp_percentage(percentage) / HUNDRED)
+    return quantize_volume(nominal * factor)
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityLimit:
+    """一条能力限制事件在 UTC 时间轴上的半开区间 [starts_at, ends_at)。
+
+    ends_at 为 None 表示开放式（持续生效）；capacity_percent 为该区间内
+    相对额定能力的百分比上限；source_id/source_type/label 用于在分配结果中
+    保留限制来源。
+    """
+
+    source_id: str
+    starts_at: datetime
+    ends_at: datetime | None
+    capacity_percent: Decimal
+    source_type: str = "outage"
+    label: str = ""
+
+    def normalized(self) -> "CapacityLimit":
+        if self.ends_at is None:
+            return self
+        return CapacityLimit(
+            source_id=self.source_id,
+            starts_at=self.starts_at,
+            ends_at=max(self.ends_at, self.starts_at),
+            capacity_percent=clamp_percentage(self.capacity_percent),
+            source_type=self.source_type,
+            label=self.label,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CapacitySegment:
+    """扫描出的均匀能力时段（半开区间）及当时生效的限制来源。"""
+
+    starts_at: datetime
+    ends_at: datetime
+    factor: Decimal
+    sources: tuple[str, ...]
+
+
+def service_day_bounds(service_date: str) -> tuple[datetime, datetime]:
+    """服务日对应的 UTC 半开区间 [当日 00:00:00Z, 次日 00:00:00Z)。"""
+    day = date.fromisoformat(service_date)
+    start = datetime.combine(day, time.min, tzinfo=UTC)
+    return start, start + timedelta(days=1)
+
+
+def capacity_profile(
+    limits: Iterable[CapacityLimit],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[CapacitySegment]:
+    """扫描限制事件，把窗口切分为能力均匀的时段。
+
+    规则：
+    - 区间均为半开区间，边界相接（前一事件 ends_at 等于下一事件 starts_at）
+      不会产生重叠时刻；
+    - 同一时刻多条限制并存时取最小百分比（最严格上限），不连乘、不重复扣减；
+    - 同一限制在扫描中按 source_id 去重，重复登记/重放同一事件只计一次；
+    - 百分比裁剪到 [0,100]：负值按 0（零能力窗口），超过 100 按 100（不扩容）；
+    - 与窗口仅端点相接的事件不产生任何时段。
+    """
+    if window_end <= window_start:
+        raise ValueError("能力窗口必须为正区间")
+
+    # 按 source_id 去重（同一事件重放），再裁剪百分比并收集边界。
+    unique: dict[str, CapacityLimit] = {}
+    for raw in limits:
+        limit = raw.normalized()
+        if limit.source_id in unique:
+            continue
+        unique[limit.source_id] = limit
+
+    boundaries = {window_start, window_end}
+    active: list[CapacityLimit] = []
+    for limit in unique.values():
+        clipped_end = window_end if limit.ends_at is None else min(limit.ends_at, window_end)
+        clipped_start = max(limit.starts_at, window_start)
+        if clipped_start < clipped_end:  # 半开区间：端点相接不算重叠
+            active.append(limit)
+            boundaries.add(clipped_start)
+            boundaries.add(clipped_end)
+
+    ordered = sorted(boundaries)
+    segments: list[CapacitySegment] = []
+    for left, right in zip(ordered, ordered[1:]):
+        if right <= left:
+            continue
+        factor = ONE
+        sources: set[str] = set()
+        midpoint = left + (right - left) / 2
+        for limit in active:
+            limit_end = limit.ends_at
+            applies = limit.starts_at <= midpoint and (limit_end is None or midpoint < limit_end)
+            if applies:
+                factor = min(factor, clamp_percentage(limit.capacity_percent) / HUNDRED)
+                sources.add(limit.source_id)
+        segments.append(
+            CapacitySegment(left, right, factor, tuple(sorted(sources)))
+        )
+    return segments
+
+
+@dataclass(frozen=True, slots=True)
+class DailyCapacity:
+    """服务日内的有效能力汇总。"""
+
+    service_date: str
+    nominal: Decimal
+    effective: Decimal
+    segments: tuple[CapacitySegment, ...] = ()
+
+    def source_segments(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for segment in self.segments:
+            rows.append({
+                "starts_at": segment.starts_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                "ends_at": segment.ends_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                "capacity_percent": decimal_text(segment.factor * HUNDRED),
+                "source_ids": list(segment.sources),
+            })
+        return rows
+
+    def binding_sources(self) -> tuple[str, ...]:
+        """至少在一个时段生效（成为绑定上限）的限制来源，按编号排序去重。"""
+        seen: set[str] = set()
+        for segment in self.segments:
+            seen.update(segment.sources)
+        return tuple(sorted(seen))
+
+
+def daily_effective_capacity(
+    nominal: Decimal,
+    limits: Iterable[CapacityLimit],
+    service_date: str,
+) -> DailyCapacity:
+    """按 UTC 服务日扫描限制事件并按秒加权求有效能力。
+
+    跨午夜检修被拆到各自服务日；零能力窗口（factor=0）按其时长直接清零
+    对应部分能力。输入顺序不影响结果。
+    """
+    window_start, window_end = service_day_bounds(service_date)
+    segments = tuple(capacity_profile(limits, window_start, window_end))
+    weighted = ZERO
+    for segment in segments:
+        seconds = Decimal((segment.ends_at - segment.starts_at).total_seconds())
+        weighted += nominal * segment.factor * seconds
+    effective = weighted / DAY_SECONDS
+    return DailyCapacity(
+        service_date=service_date,
+        nominal=quantize_volume(nominal),
+        effective=quantize_volume(effective),
+        segments=segments,
+    )
 
 
 @dataclass(frozen=True, slots=True)

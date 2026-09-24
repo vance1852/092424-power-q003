@@ -8,10 +8,110 @@ from decimal import Decimal
 
 from power_dispatch.api import JsonApplication
 from power_dispatch.clock import FrozenClock
-from power_dispatch.errors import Conflict, Forbidden
-from power_dispatch.planning import AllocationRequest, PricePoint, allocate_capacity, latest_streak
+from power_dispatch.errors import Conflict, Forbidden, ValidationFailed
+from power_dispatch.planning import (
+    AllocationRequest,
+    CapacityLimit,
+    PricePoint,
+    allocate_capacity,
+    capacity_profile,
+    daily_effective_capacity,
+    effective_capacity,
+    latest_streak,
+)
 from power_dispatch.service import SupplyService
 from power_dispatch.risk import DemandBucket, inventory_coverage, mark_to_market, supply_gap
+
+
+class CapacityRuleTests(unittest.TestCase):
+    @staticmethod
+    def _utc(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    def test_overlapping_limits_take_minimum_never_multiply(self) -> None:
+        self.assertEqual(effective_capacity(Decimal("100"), [Decimal("60"), Decimal("40")]), Decimal("40.000"))
+        self.assertEqual(effective_capacity(Decimal("100"), [Decimal("80"), Decimal("60")]), Decimal("60.000"))
+
+    def test_percentages_out_of_range_are_clamped_to_nearest_bound(self) -> None:
+        self.assertEqual(effective_capacity(Decimal("100"), [Decimal("150")]), Decimal("100.000"))
+        self.assertEqual(effective_capacity(Decimal("100"), [Decimal("-10")]), Decimal("0.000"))
+        self.assertEqual(effective_capacity(Decimal("100"), [Decimal("-10"), Decimal("200")]), Decimal("0.000"))
+
+    def test_touching_half_open_intervals_do_not_double_apply(self) -> None:
+        start = self._utc("2026-09-25T10:00:00Z")
+        end = self._utc("2026-09-25T14:00:00Z")
+        segments = capacity_profile(
+            [
+                CapacityLimit("outage-1", self._utc("2026-09-25T10:00:00Z"), self._utc("2026-09-25T12:00:00Z"), Decimal("50")),
+                CapacityLimit("outage-2", self._utc("2026-09-25T12:00:00Z"), self._utc("2026-09-25T14:00:00Z"), Decimal("50")),
+            ],
+            start,
+            end,
+        )
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0].sources, ("outage-1",))
+        self.assertEqual(segments[1].sources, ("outage-2",))
+        self.assertTrue(all(segment.factor == Decimal("0.5") for segment in segments))
+
+    def test_same_event_replayed_is_deduplicated(self) -> None:
+        start = self._utc("2026-09-25T00:00:00Z")
+        end = self._utc("2026-09-26T00:00:00Z")
+        limit = CapacityLimit("outage-7", start, end, Decimal("50"))
+        segments = capacity_profile([limit, limit], start, end)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].sources, ("outage-7",))
+        self.assertEqual(daily_effective_capacity(Decimal("100"), [limit, limit], "2026-09-25").effective, Decimal("50.000"))
+
+    def test_overlap_uses_minimum_only_inside_overlapping_window(self) -> None:
+        limits = [
+            CapacityLimit("outage-1", self._utc("2026-09-25T00:00:00Z"), self._utc("2026-09-26T00:00:00Z"), Decimal("60")),
+            CapacityLimit("outage-2", self._utc("2026-09-25T00:00:00Z"), self._utc("2026-09-25T06:00:00Z"), Decimal("40")),
+        ]
+        plan = daily_effective_capacity(Decimal("100000"), limits, "2026-09-25")
+        # 6 小时受 40% 约束，18 小时受 60% 约束：100000*(6*0.4+18*0.6)/24
+        self.assertEqual(plan.effective, Decimal("55000.000"))
+        sources = {tuple(seg.sources) for seg in plan.segments}
+        self.assertIn(("outage-1", "outage-2"), sources)
+        self.assertIn(("outage-1",), sources)
+
+    def test_cross_midnight_outage_is_split_across_service_days(self) -> None:
+        limits = [
+            CapacityLimit(
+                "outage-1",
+                self._utc("2026-09-25T20:00:00Z"),
+                self._utc("2026-09-26T04:00:00Z"),
+                Decimal("50"),
+            )
+        ]
+        first = daily_effective_capacity(Decimal("100000"), limits, "2026-09-25")
+        second = daily_effective_capacity(Decimal("100000"), limits, "2026-09-26")
+        # 每个服务日各覆盖 4 小时降容：100000*(20+4*0.5)/24
+        self.assertEqual(first.effective, Decimal("91666.667"))
+        self.assertEqual(second.effective, Decimal("91666.667"))
+        last = first.segments[-1]
+        self.assertEqual(last.starts_at, self._utc("2026-09-25T20:00:00Z"))
+        self.assertEqual(last.ends_at, self._utc("2026-09-26T00:00:00Z"))
+
+    def test_zero_capacity_window_clears_only_its_duration(self) -> None:
+        limits = [
+            CapacityLimit(
+                "outage-1",
+                self._utc("2026-09-25T10:00:00Z"),
+                self._utc("2026-09-25T14:00:00Z"),
+                Decimal("0"),
+            )
+        ]
+        plan = daily_effective_capacity(Decimal("100000"), limits, "2026-09-25")
+        self.assertEqual(plan.effective, Decimal("83333.333"))
+        zero = [seg for seg in plan.segments if seg.factor == 0]
+        self.assertEqual(len(zero), 1)
+
+    def test_open_ended_limit_covers_remainder_of_day(self) -> None:
+        limits = [
+            CapacityLimit("outage-1", self._utc("2026-09-25T12:00:00Z"), None, Decimal("50"))
+        ]
+        plan = daily_effective_capacity(Decimal("100"), limits, "2026-09-25")
+        self.assertEqual(plan.effective, Decimal("75.000"))
 
 
 class PlanningTests(unittest.TestCase):
@@ -94,7 +194,7 @@ class SupplyServiceTests(unittest.TestCase):
             self.service.submit_nomination("dispatch", changed)
 
     def test_outage_reduces_allocation_and_transfer_consumes_inventory(self) -> None:
-        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-25T23:59:59Z", "50", "检修")
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "50", "检修")
         for number, requested, priority in ((1, "40000", 10), (2, "30000", 20)):
             self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "pipe-a-b", "shipper_id": f"shipper-{number}", "service_date": "2026-09-25", "requested_mwh": requested, "priority": priority, "idempotency_key": f"key-{number}"})
         allocation = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
@@ -129,6 +229,89 @@ class SupplyServiceTests(unittest.TestCase):
         response = app.handle("GET", "/quotes/summary/PEAK_VALLEY", {"X-Actor-Id": "plan"})
         self.assertEqual(response.status, 404)
         self.assertEqual(response.body["error"]["code"], "not_found")
+
+    def _nominate(self, number: int, requested: str, priority: int = 10, day: str = "2026-09-25") -> None:
+        self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "pipe-a-b", "shipper_id": f"shipper-{number}", "service_date": day, "requested_mwh": requested, "priority": priority, "idempotency_key": f"key-{number}"})
+
+    def test_overlapping_maintenance_and_curtailment_never_compound(self) -> None:
+        # 检修降容 60% 覆盖全天；临时限电 80% 只覆盖前 12 小时。
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "60", "检修降容")
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-25T12:00:00Z", "80", "临时限电")
+        self._nominate(1, "100000")
+        allocation = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        # 绝不能连乘成 48000；重叠时段取最严格的 60%。
+        self.assertEqual(allocation["available_capacity"], "60000.000")
+        self.assertEqual(allocation["allocations"][0]["allocated_mwh"], "60000.000")
+        reasons = {limit["reason"] for limit in allocation["capacity_limits"]}
+        self.assertEqual(reasons, {"检修降容", "临时限电"})
+        referenced = {source for segment in allocation["capacity_segments"] for source in segment["source_ids"]}
+        declared = {limit["source_id"] for limit in allocation["capacity_limits"]}
+        self.assertTrue(referenced <= declared)
+
+    def test_touching_boundaries_split_day_without_extra_deduction(self) -> None:
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-25T12:00:00Z", "50", "上午检修")
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T12:00:00Z", "2026-09-26T00:00:00Z", "50", "下午限电")
+        self._nominate(1, "100000")
+        allocation = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        self.assertEqual(allocation["available_capacity"], "50000.000")
+
+    def test_duplicate_event_announcement_is_rejected(self) -> None:
+        payload = ("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "50", "检修")
+        self.service.announce_outage(*payload)
+        with self.assertRaises(Conflict):
+            self.service.announce_outage(*payload)
+
+    def test_percentage_out_of_range_or_non_numeric_is_rejected(self) -> None:
+        for bad in ("120", "-1", "abc"):
+            with self.assertRaises(ValidationFailed):
+                self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", bad, "检修")
+
+    def test_zero_capacity_window_cancels_all_nominations(self) -> None:
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "0", "全停")
+        self._nominate(1, "30000", priority=10)
+        self._nominate(2, "20000", priority=20)
+        allocation = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        self.assertEqual(allocation["available_capacity"], "0.000")
+        self.assertTrue(all(row["allocated_mwh"] == "0.000" for row in allocation["allocations"]))
+        states = {row["nomination_id"]: row["state"] for row in self.connection.execute("SELECT nomination_id,state FROM nominations")}
+        self.assertEqual(set(states.values()), {"cancelled"})
+
+    def test_cross_midnight_outage_spans_two_service_days(self) -> None:
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T20:00:00Z", "2026-09-26T04:00:00Z", "50", "跨夜检修")
+        self._nominate(1, "100000", day="2026-09-25")
+        self._nominate(2, "100000", day="2026-09-26")
+        first = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        second = self.service.allocate("dispatch", "pipe-a-b", "2026-09-26")
+        self.assertEqual(first["available_capacity"], "91666.667")
+        self.assertEqual(second["available_capacity"], "91666.667")
+
+    def test_recompute_same_service_day_reuses_confirmed_plan(self) -> None:
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "50", "检修")
+        self._nominate(1, "40000", priority=10)
+        self._nominate(2, "30000", priority=20)
+        first = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        second = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        self.assertFalse(first["replayed"])
+        self.assertTrue(second["replayed"])
+        self.assertEqual(first["allocation_id"], second["allocation_id"])
+        self.assertEqual(second["available_capacity"], "50000.000")
+        self.assertEqual(second["allocations"], first["allocations"])
+        revisions = {row["nomination_id"]: row["revision"] for row in self.connection.execute("SELECT nomination_id,revision FROM nominations")}
+        self.assertEqual(revisions, {"nom-1": 2, "nom-2": 2})
+
+    def test_event_revision_after_confirmation_does_not_rewrite_plan(self) -> None:
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "50", "检修")
+        self._nominate(1, "40000")
+        first = self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        # 计划确认后又登记一条更严格的限电事件。
+        self.service.announce_outage("risk", "pipe-a-b", "2026-09-25T00:00:00Z", "2026-09-26T00:00:00Z", "20", "新增限电")
+        with self.assertRaises(Conflict):
+            self.service.allocate("dispatch", "pipe-a-b", "2026-09-25")
+        stored = self.connection.execute("SELECT available_capacity FROM allocation_runs WHERE route_id='pipe-a-b' AND service_date='2026-09-25'").fetchone()
+        self.assertEqual(stored["available_capacity"], first["available_capacity"])
+        nomination = self.connection.execute("SELECT allocated_mwh,revision FROM nominations WHERE nomination_id='nom-1'").fetchone()
+        self.assertEqual(nomination["allocated_mwh"], "40000.000")
+        self.assertEqual(nomination["revision"], 2)
 
 
 if __name__ == "__main__":
